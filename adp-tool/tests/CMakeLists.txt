@@ -28,4 +28,5 @@ set_target_properties(adp-tool-tests PROPERTIES
 	CXX_EXTENSIONS OFF)
 
 include(Catch)
-catch_discover_tests(adp-tool-tests)
+# A server regression that blocks on a slow client hangs rather than fails.
+catch_discover_tests(adp-tool-tests PROPERTIES TIMEOUT 60)

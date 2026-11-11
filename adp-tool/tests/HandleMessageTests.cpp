@@ -80,9 +80,9 @@ TEST_CASE("Configure edits of one pad wait their turn without being overtaken", 
 	using A = Application;
 	const auto now = A::Clock::now();
 	std::deque<A::Inbound> backlog = {
-	    {"c1", {{"pad", "p1"}, {"sensors", json::array()}}},
-	    {"c1", {{"pad", "p1"}, {"releaseMode", 0}}},
-	    {"c1", {{"pad", "p2"}, {"sensors", json::array()}}},
+	    {"c1", {{"pad", "p1"}, {"sensors", json::array()}}, {}},
+	    {"c1", {{"pad", "p1"}, {"releaseMode", 0}}, {}},
+	    {"c1", {{"pad", "p2"}, {"sensors", json::array()}}, {}},
 	};
 	std::map<std::string, A::Clock::time_point> last;
 	CHECK(A::NextDue(backlog, last, {}, now) == 0);
@@ -181,5 +181,105 @@ TEST_CASE("The server admits clients, queues their messages and forgets them on 
 
 	server.Stop();
 	serverThread.join();
+	ix::uninitNetSystem();
+}
+
+// Connects, completes the WebSocket handshake and reads up to the hello, then
+// never reads again, like an asleep phone whose socket stays open. Returns
+// whether it got that far. The hello may go out while the server is still
+// listing the client, but under clientsMutex, so any send after it reaches
+// this client.
+static bool ConnectAndStopReading(int port, ix::socket_t& fd)
+{
+	fd = ::socket(AF_INET, SOCK_STREAM, 0);
+	int small = 4096;
+	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char*)&small, sizeof(small));
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons((uint16_t)port);
+	inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+	if (::connect(fd, (const sockaddr*)&addr, sizeof(addr)) != 0)
+		return false;
+	const std::string request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+	                            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+	if (::send(fd, request.data(), (int)request.size(), 0) != (int)request.size())
+		return false;
+	std::string received;
+	char c;
+	while (received.find("\"msgType\":0") == std::string::npos && received.size() < 4096 &&
+	       ::recv(fd, &c, 1, 0) == 1)
+		received.push_back(c);
+	return received.rfind("HTTP/1.1 101", 0) == 0 && received.find("\"msgType\":0") != std::string::npos;
+}
+
+static void CloseSocket(ix::socket_t fd)
+{
+#ifdef _WIN32
+	closesocket(fd);
+#else
+	close(fd);
+#endif
+}
+
+TEST_CASE("A client that stops reading holds up no one else", "[websocket]")
+{
+	using namespace std::chrono_literals;
+	const auto waitFor = [](auto done) {
+		for (int i = 0; i < 500; ++i, std::this_thread::sleep_for(10ms))
+			if (done())
+				return true;
+		return false;
+	};
+	constexpr int port = 18009;
+	ix::initNetSystem();
+	MSGQ<QueueMessage> queue;
+	std::atomic<bool> running{true};
+	WebsocketServer server;
+	std::thread serverThread(&WebsocketServer::Init, &server, std::ref(queue), std::string("127.0.0.1"),
+	                         WebsocketAccess{}, std::ref(running), port);
+
+	std::atomic<bool> hello{false};
+	std::atomic<int> snapshots{0};
+	std::atomic<bool> gotLast{false};
+	ix::WebSocket good;
+	good.setUrl("ws://127.0.0.1:" + std::to_string(port) + "/");
+	good.setMinWaitBetweenReconnectionRetries(10);
+	good.setOnMessageCallback([&](const ix::WebSocketMessagePtr& m) {
+		if (m->type != ix::WebSocketMessageType::Message)
+			return;
+		hello = hello || m->str.find("\"msgType\":0") != std::string::npos;
+		if (m->str.find("\"pad\":\"p\"") != std::string::npos)
+			snapshots++;
+		gotLast = gotLast || m->str.find("\"n\":99") != std::string::npos;
+	});
+	good.start();
+	// CHECKs, not REQUIREs, from here: the server thread must be joined either way.
+	const bool connected = waitFor([&] { return hello.load(); });
+	CHECK(connected);
+	ix::socket_t stalled{};
+	const bool admitted = connected && ConnectAndStopReading(port, stalled);
+	CHECK(admitted);
+	if (admitted)
+	{
+		// Far more than any socket buffer holds: the stalled client's sends block.
+		const std::string big = "\"" + std::string(1 << 20, 'x') + "\"";
+		const auto start = std::chrono::steady_clock::now();
+		for (int i = 0; i < 32; ++i)
+			server.SendMessageToClients(big);
+		for (int n = 0; n < 100; ++n)
+			server.SendSnapshot("p", R"({"msgType":1,"pad":"p","n":)" + std::to_string(n) + "}");
+		CHECK(std::chrono::steady_clock::now() - start < 1s);
+
+		CHECK(waitFor([&] { return gotLast.load(); }));
+		CHECK(snapshots > 0);
+	}
+
+	const auto stopStart = std::chrono::steady_clock::now();
+	good.stop();
+	server.Stop();
+	serverThread.join();
+	CHECK(std::chrono::steady_clock::now() - stopStart < 5s);
+	if (connected)
+		CloseSocket(stalled);
 	ix::uninitNetSystem();
 }

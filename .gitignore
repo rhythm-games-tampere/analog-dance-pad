@@ -17,3 +17,4 @@ firmware/build/.vs
 firmware/.vs
 firmware/.pio
 firmware/.vscode
+.DS_Store
