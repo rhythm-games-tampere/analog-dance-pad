@@ -474,6 +474,8 @@ uint64_t Version()
 
 bool Has(const std::string& name)
 {
+	if (name == GUEST)
+		return true;
 	const auto list = Get();
 	return std::any_of(list->players.begin(), list->players.end(), [&](const Player& p) { return p.name == name; });
 }

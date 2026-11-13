@@ -530,3 +530,88 @@ TEST_CASE("Buttons can be named, and the names follow a pad rename", "[deviceops
 	REQUIRE(Server::Send({{"pad", "p1"}, {"name", "New"}})["ok"] == true);
 	CHECK(Server::PadState("p1")["buttonNames"]["1"] == "Left");
 }
+
+TEST_CASE("The guest is always a known player", "[deviceops]")
+{
+	Server server;
+	server.AddPad("p1", "Cab1 P1");
+
+	const json r = Server::Send({{"pad", "p1"}, {"saveProfile", {{"player", "Guest"}, {"name", "Loose"}}}});
+	CHECK(r["ok"] == true);
+	CHECK(Profiles::Exists(Profiles::PlayerPadDir(server.dir, "Guest", "Cab1 P1"), "loose"));
+}
+
+TEST_CASE("Selecting a player loads their last used profile, else their newest", "[deviceops]")
+{
+	Server server;
+	server.AddPad("p1", "Cab1 P1");
+	REQUIRE(Server::Send({{"pad", "p1"}, {"saveProfile", {{"player", "Mike"}, {"name", "First"}}}})["ok"] == true);
+	REQUIRE(Server::Send({{"pad", "p1"}, {"saveProfile", {{"player", "Mike"}, {"name", "Second"}}}})["ok"] == true);
+	REQUIRE(Server::Send({{"pad", "p1"}, {"loadProfile", {{"player", "Mike"}, {"id", "first"}}}})["ok"] == true);
+	REQUIRE(Server::Send({{"pad", "p1"}, {"selectPlayer", {{"player", "Guest"}}}})["ok"] == true);
+
+	json r = Server::Send({{"pad", "p1"}, {"selectPlayer", {{"player", "Mike"}}}});
+	CHECK(r["ok"] == true);
+	CHECK(r["name"] == "First");
+	CHECK(Server::PadState("p1")["profileId"] == "first");
+
+	// The last used one is gone: the newest of what is left.
+	REQUIRE(Server::Send({{"pad", "p1"}, {"deleteProfile", {{"player", "Mike"}, {"id", "first"}}}})["ok"] == true);
+	r = Server::Send({{"pad", "p1"}, {"selectPlayer", {{"player", "Mike"}}}});
+	CHECK(r["name"] == "Second");
+}
+
+TEST_CASE("A player without profiles gets the guest's, made from the pad the first time", "[deviceops]")
+{
+	Server server;
+	server.AddPad("p1", "Cab1 P1");
+	const auto guestDir = Profiles::PlayerPadDir(server.dir, "Guest", "Cab1 P1");
+
+	json r = Server::Send({{"pad", "p1"}, {"selectPlayer", {{"player", "Mike"}}}});
+	CHECK(r["ok"] == true);
+	CHECK(r["name"] == "Guest");
+	CHECK(Profiles::Exists(guestDir, "guest"));
+	CHECK(Server::PadState("p1")["player"] == "Guest");
+
+	r = Server::Send({{"pad", "p1"}, {"selectPlayer", {{"player", "Mike"}}}});
+	CHECK(r["ok"] == true);
+	CHECK(Profiles::List(guestDir).size() == 1);
+}
+
+TEST_CASE("The game sets the player of a side's pad", "[deviceops]")
+{
+	Server server;
+	server.AddPad("p1", "Cab1 P1");
+	server.AddPad("p2", "Cab1 P2");
+	REQUIRE(Server::Send({{"pad", "p1"}, {"side", 1}})["ok"] == true);
+	REQUIRE(Server::Send({{"pad", "p2"}, {"side", 2}})["ok"] == true);
+	REQUIRE(Server::Send({{"pad", "p2"}, {"saveProfile", {{"player", "Mike"}, {"name", "Tech"}}}})["ok"] == true);
+	REQUIRE(Server::Send({{"pad", "p2"}, {"selectPlayer", {{"player", "Guest"}}}})["ok"] == true);
+
+	Device::HandleClientMessage(json{{"setPlayer", {{"side", 2}, {"player", "Mike"}}}}.dump());
+	CHECK(Server::PadState("p2")["player"] == "Mike");
+	CHECK(Server::PadState("p2")["profileId"] == "tech");
+	CHECK_FALSE(Server::PadState("p1").contains("player"));
+
+	// Leaving, or a name the server doesn't know: the guest.
+	Device::HandleClientMessage(json{{"setPlayer", {{"side", 2}, {"player", nullptr}}}}.dump());
+	CHECK(Server::PadState("p2")["player"] == "Guest");
+	Device::HandleClientMessage(json{{"setPlayer", {{"side", 1}, {"player", "Nobody"}}}}.dump());
+	CHECK(Server::PadState("p1")["player"] == "Guest");
+}
+
+TEST_CASE("A side belongs to one pad", "[deviceops]")
+{
+	Server server;
+	server.AddPad("p1", "Cab1 P1");
+	server.AddPad("p2", "Cab1 P2");
+
+	REQUIRE(Server::Send({{"pad", "p1"}, {"side", 1}})["ok"] == true);
+	REQUIRE(Server::Send({{"pad", "p2"}, {"side", 1}})["ok"] == true);
+	CHECK_FALSE(Server::PadState("p1").contains("side"));
+	CHECK(Server::PadState("p2")["side"] == 1);
+
+	REQUIRE(Server::Send({{"pad", "p2"}, {"side", 0}})["ok"] == true);
+	CHECK_FALSE(Server::PadState("p2").contains("side"));
+	CHECK(Server::Send({{"pad", "p2"}, {"side", 3}})["ok"] == false);
+}
