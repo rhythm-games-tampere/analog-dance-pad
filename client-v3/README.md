@@ -59,6 +59,7 @@ To create a production version of your app:
 npm run build
 ```
 
-You can preview the production build with `npm run preview`.
+This prerenders the app into `build/` as static files ([`adapter-static`](https://svelte.dev/docs/kit/adapter-static)),
+which any web server can serve as they are, from the root or from a subdirectory.
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+You can preview the production build with `npm run preview`.

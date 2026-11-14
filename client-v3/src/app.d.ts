@@ -5,7 +5,11 @@ declare global {
 		// interface Error {}
 		// interface Locals {}
 		// interface PageData {}
-		// interface PageState {}
+		/** Open modals are shallow history entries, so Back closes them. */
+		interface PageState {
+			sensor?: number; // snapshot index of the sensor being edited
+			calibrate?: boolean;
+		}
 		// interface Platform {}
 	}
 }

@@ -6,10 +6,11 @@
 		label: string; // the button's name, or "Button N"
 		releaseEnabled: boolean; // false in "None" mode: hide the release marker
 		onthreshold: (value: number) => void;
-		onedit: () => void;
+		oncommit: () => void; // an edit is complete (drag released, key nudge)
+		onedit?: () => void; // makes the whole element (labels included) a button
 	}
 
-	let { sensor, label, releaseEnabled, onthreshold, onedit }: Props = $props();
+	let { sensor, label, releaseEnabled, onthreshold, oncommit, onedit }: Props = $props();
 
 	let trackEl = $state<HTMLDivElement | null>(null);
 	let dragging = $state(false);
@@ -27,7 +28,7 @@
 	}
 
 	function onPointerDown(e: PointerEvent) {
-		e.stopPropagation(); // dragging the threshold must not open the editor
+		e.stopPropagation();
 		dragging = true;
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 		onthreshold(valueFromPointer(e.clientY));
@@ -49,32 +50,28 @@
 		};
 		if (!(e.key in step)) return;
 		e.preventDefault();
-		e.stopPropagation(); // Space/Enter on the track open the editor; arrows don't
+		e.stopPropagation(); // Space/Enter open the editor; arrows don't
 		onthreshold(Math.min(1, Math.max(0, sensor.threshold + step[e.key])));
+		oncommit();
 	}
 	function onPointerUp(e: PointerEvent) {
+		if (dragging) oncommit();
 		dragging = false;
 		(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
 	}
 </script>
 
-<div class="flex h-full flex-col items-center gap-1 select-none">
+{#snippet content()}
 	<span class="text-muted-foreground text-sm leading-none tabular-nums">
 		{sensor.disabled ? 'off' : `${pct(sensor.value)}%`}
 	</span>
 
-	<!-- tap the track (outside the drag handle) to open the editor -->
 	<div
 		bind:this={trackEl}
-		class="bg-muted relative w-full min-h-0 flex-1 cursor-pointer overflow-hidden rounded-md {sensor.disabled
+		class="bg-muted relative min-h-0 w-full flex-1 overflow-hidden rounded-md {sensor.disabled
 			? 'opacity-40'
 			: ''}"
 		title={sensor.disabled ? "The pad doesn't read this sensor" : undefined}
-		onclick={onedit}
-		role="button"
-		tabindex="0"
-		aria-label="Edit {label}"
-		onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && onedit()}
 	>
 		<!-- value fill -->
 		<div
@@ -103,7 +100,11 @@
 		<div
 			class="absolute inset-x-0 h-11 cursor-row-resize touch-none"
 			style="bottom: calc({pct(sensor.threshold)}% - 22px)"
-			onclick={(e) => e.stopPropagation()}
+			onclick={(e) => {
+				// a drag ends in a click: it must not open the editor or follow the box's link
+				e.preventDefault();
+				e.stopPropagation();
+			}}
 			onkeydown={onKeyDown}
 			onpointerdown={onPointerDown}
 			onpointermove={onPointerMove}
@@ -121,4 +122,21 @@
 	<span class="text-primary text-sm leading-none font-medium tabular-nums">
 		{pct(sensor.threshold)}%
 	</span>
-</div>
+{/snippet}
+
+{#if onedit}
+	<div
+		class="flex h-full cursor-pointer flex-col items-center gap-1 px-0.5 select-none sm:px-1"
+		onclick={onedit}
+		role="button"
+		tabindex="0"
+		aria-label="Edit {label}"
+		onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && onedit()}
+	>
+		{@render content()}
+	</div>
+{:else}
+	<div class="flex h-full flex-col items-center gap-1 px-0.5 select-none sm:px-1">
+		{@render content()}
+	</div>
+{/if}

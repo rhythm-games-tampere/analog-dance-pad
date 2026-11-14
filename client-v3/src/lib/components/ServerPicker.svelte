@@ -6,9 +6,9 @@
 	<h1 class="text-2xl font-bold">Which machine?</h1>
 	<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
 		{#each pads.conns as c (c.endpoint)}
-			<button
+			<a
+				href={pads.href('pad', { server: c.name })}
 				class="bg-card ring-foreground/10 hover:ring-primary flex min-h-32 flex-col items-center justify-center gap-2 rounded-xl ring-1 transition"
-				onclick={() => pads.selectServer(c.endpoint)}
 			>
 				<span class="text-3xl font-bold tracking-wide">{c.name}</span>
 				<span class="text-muted-foreground flex items-center gap-1.5 text-sm">
@@ -23,7 +23,7 @@
 						? `${c.deviceList.length} ${c.deviceList.length === 1 ? 'pad' : 'pads'}`
 						: c.status}
 				</span>
-			</button>
+			</a>
 		{/each}
 	</div>
 </div>

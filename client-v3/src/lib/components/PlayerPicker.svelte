@@ -1,12 +1,13 @@
 <script lang="ts">
-	import { pads, type Player } from '$lib/pads.svelte';
+	import { pads, GUEST, type Player } from '$lib/pads.svelte';
 	import { Input } from '$lib/components/ui/input';
 	import Avatar from './Avatar.svelte';
 
 	let query = $state('');
 
 	const padName = $derived(pads.device?.name ?? '');
-	const players = $derived(pads.players);
+	const players = $derived(pads.players.filter((p) => p.name !== GUEST));
+	const guest: Player = { name: GUEST, avatar: false, profiles: {} };
 	const recent = $derived(
 		(pads.padState?.recent ?? [])
 			.map((n) => players.find((p) => p.name === n))
@@ -22,13 +23,13 @@
 </script>
 
 {#snippet tile(p: Player)}
-	<button
+	<a
+		href={pads.href('profile', { player: p.name })}
 		class="bg-card ring-foreground/10 hover:ring-primary relative flex flex-col items-center gap-2 rounded-xl p-3 ring-1 transition {count(
 			p
-		) === 0
+		) === 0 && p.name !== GUEST
 			? 'opacity-60'
 			: ''}"
-		onclick={() => pads.selectPlayer(p.name)}
 	>
 		<Avatar player={p} />
 		<span class="w-full truncate text-center font-medium">{p.name}</span>
@@ -38,7 +39,7 @@
 				>{count(p)}</span
 			>
 		{/if}
-	</button>
+	</a>
 {/snippet}
 
 <div class="flex flex-col gap-5">
@@ -60,6 +61,7 @@
 	<div class="flex flex-col gap-2">
 		{#if !query}<span class="text-muted-foreground text-sm">All players</span>{/if}
 		<div class="grid grid-cols-3 gap-3 sm:grid-cols-5 lg:grid-cols-6">
+			{#if !query}{@render tile(guest)}{/if}
 			{#each filtered as p (p.name)}
 				{@render tile(p)}
 			{/each}

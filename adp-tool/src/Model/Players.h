@@ -31,6 +31,11 @@ namespace adp::Players
 using json = nlohmann::json;
 using Path = std::filesystem::path;
 
+// The player whoever has no profile of their own plays as: always known (see
+// Has), never in the scanned list. A LocalProfiles player of that name shares
+// its profiles.
+inline constexpr const char* GUEST = "Guest";
+
 struct Player
 {
 	std::string name;                         // DisplayName, the profile key
@@ -107,8 +112,8 @@ std::shared_ptr<const PlayerList> Get();
 // Bumped when a scan finds a different list, so the broadcaster knows to resend.
 uint64_t Version();
 
-// True if `name` is a known player. Client-supplied names are checked with
-// this before any path is built from them.
+// True if `name` is a known player or GUEST. Client-supplied names are
+// checked with this before any path is built from them.
 bool Has(const std::string& name);
 
 // msgType 7 {name, mime, data(base64)} for one player's avatar. mime/data are

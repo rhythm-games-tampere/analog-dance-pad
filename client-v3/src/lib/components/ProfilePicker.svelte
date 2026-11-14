@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { pads, MAX_PROFILES, type Profile } from '$lib/pads.svelte';
+	import { pads, GUEST, MAX_PROFILES, type Profile } from '$lib/pads.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import LoaderIcon from '@lucide/svelte/icons/loader-circle';
@@ -24,12 +24,14 @@
 		pads.loadProfile(p.id);
 	}
 
-	// A player with exactly one profile here gets it loaded right away (once,
-	// when arriving from the player step; the header chip comes back here freely).
+	// Once, when arriving from the player screen (the header chip comes back
+	// here freely): the guest goes straight to tuning, a player with exactly one
+	// profile gets it loaded, one with none gets the guest's settings to start from.
 	$effect(() => {
-		if (!pads.autoLoad || profiles === undefined) return;
+		if (!pads.autoLoad || (pads.player !== GUEST && profiles === undefined)) return;
 		pads.autoLoad = false;
-		if (profiles.length === 1) load(profiles[0]);
+		if (pads.player === GUEST || profiles?.length === 0) pads.selectPlayer();
+		else if (profiles?.length === 1) pads.loadProfile(profiles[0].id, true);
 	});
 
 	function create() {

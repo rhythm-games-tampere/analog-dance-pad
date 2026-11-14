@@ -1,18 +1,10 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
-	import { resolve } from '$app/paths';
 	import { pads, type MappedSensor } from '$lib/pads.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import * as Card from '$lib/components/ui/card';
 	import * as Select from '$lib/components/ui/select';
-	import { onMount } from 'svelte';
-
-	// Configures the pad picked in the main flow; without one, go pick it.
-	onMount(() => {
-		if (!pads.pad) goto(resolve('/'));
-	});
 
 	const snap = $derived(pads.activeSnapshot);
 	const numButtons = $derived(pads.device?.numButtons ?? 0);
@@ -64,6 +56,15 @@
 		delete buttonDrafts[b];
 	}
 
+	// Which side's player the game puts on this pad when profiles change in the game.
+	const sides = [
+		{ v: '0', label: 'None' },
+		{ v: '1', label: 'Player 1' },
+		{ v: '2', label: 'Player 2' }
+	];
+	const sideValue = $derived(String(pads.padState?.side ?? 0));
+	const sideLabel = $derived(sides.find((s) => s.v === sideValue)?.label ?? 'None');
+
 	const releaseModes = [
 		{ v: '0', label: 'None' },
 		{ v: '2', label: 'Per-sensor' }
@@ -110,7 +111,7 @@
 <div class="mx-auto flex min-h-[100dvh] max-w-4xl flex-col gap-6 p-4 sm:p-6">
 	<header class="flex flex-wrap items-center gap-2">
 		<h1 class="text-xl font-bold">{pads.serverName} · {pads.device?.name ?? 'Pad'}</h1>
-		<Button variant="outline" size="sm" class="ml-auto" onclick={() => goto(resolve('/'))}>
+		<Button variant="outline" size="sm" class="ml-auto" href={pads.href('tune')}>
 			Back to tuning
 		</Button>
 	</header>
@@ -137,6 +138,26 @@
 						onkeydown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
 						class="w-64"
 					/>
+				</div>
+
+				<div class="flex flex-col gap-1.5">
+					<Label>Player side</Label>
+					<Select.Root
+						type="single"
+						value={sideValue}
+						onValueChange={(v) => v && pads.setSide(Number(v))}
+					>
+						<Select.Trigger class="w-40">{sideLabel}</Select.Trigger>
+						<Select.Content>
+							{#each sides as s (s.v)}
+								<Select.Item value={s.v} label={s.label}>{s.label}</Select.Item>
+							{/each}
+						</Select.Content>
+					</Select.Root>
+					<p class="text-muted-foreground text-sm">
+						When a player joins, switches profile or leaves in the game, the pad on their side loads
+						their last used profile, or the guest's.
+					</p>
 				</div>
 
 				<div class="flex flex-col gap-1.5">

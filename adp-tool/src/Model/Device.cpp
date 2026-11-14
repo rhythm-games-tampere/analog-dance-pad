@@ -514,7 +514,8 @@ static Profiles::Path gProfilesDir = "profiles";
 // broadcasts the lights messages only when it matters instead of every tick.
 static std::atomic<bool> gLightsDirty{false};
 
-// Server-owned per-pad selection {player, profileId, profileName, recent[]},
+// Server-owned per-pad selection {player, profileId, profileName, recent[],
+// lastUsed{player: profileId}, side (1|2: the game side it is played from)},
 // keyed by pad name and persisted at <profilesDir>/pads/<pad>/state.json so it
 // survives restarts. Device-I/O thread only.
 static std::map<std::string, json> gPadStates;
@@ -785,6 +786,9 @@ static void SetPadSelection(const std::string& pad, const std::string& player, c
 		if (r.is_string() && r != player && recent.size() < 8)
 			recent.push_back(r);
 	st["recent"] = recent;
+	if (!st.contains("lastUsed") || !st["lastUsed"].is_object())
+		st["lastUsed"] = json::object();
+	st["lastUsed"][player] = id;
 	SavePadState(pad);
 }
 
@@ -906,6 +910,12 @@ static void FollowPlayerRenames(const std::vector<Players::Rename>& renames)
 							p = r.to;
 							changed = true;
 						}
+				if (st.contains("lastUsed") && st["lastUsed"].is_object() && st["lastUsed"].contains(r.from))
+				{
+					st["lastUsed"][r.to] = st["lastUsed"][r.from];
+					st["lastUsed"].erase(r.from);
+					changed = true;
+				}
 			}
 			if (changed)
 				SavePadState(pad);
@@ -980,8 +990,8 @@ static std::string BadText(const json& op)
 // Longest button name, in code points: it has to fit a narrow box on a phone.
 static constexpr int MAX_BUTTON_NAME = 8;
 
-static constexpr const char* PROFILE_OPS[] = {"loadProfile", "saveProfile", "importProfile", "updateProfile",
-                                              "deleteProfile"};
+static constexpr const char* PROFILE_OPS[] = {"loadProfile",   "saveProfile",   "importProfile",
+                                              "updateProfile", "deleteProfile", "selectPlayer"};
 
 // How many different ops a message asks for. More than one is refused rather
 // than one picked by priority: a configure that also carries a name must not
@@ -994,6 +1004,7 @@ static int OpCount(const json& j)
 	n += j.contains("releaseMode");
 	n += j.contains("name");
 	n += j.contains("buttonName");
+	n += j.contains("side");
 	n += j.contains("sensors") || j.contains("lightRules") || j.contains("ledMappings");
 	return n;
 }
@@ -1011,6 +1022,8 @@ static std::string OpNameOf(const json& j)
 		return "rename";
 	if (j.contains("buttonName"))
 		return "renameButton";
+	if (j.contains("side"))
+		return "setSide";
 	if (j.contains("sensors") || j.contains("lightRules") || j.contains("ledMappings"))
 		return "configure";
 	return "";
@@ -1037,6 +1050,75 @@ static std::string NotApplied(const std::vector<std::string>& failed)
 	for (const auto& f : failed)
 		what += (what.empty() ? "" : ", ") + f;
 	return what.empty() ? "not every setting reached the pad" : "not every setting reached the pad (" + what + ")";
+}
+
+// The profile `player` gets on a pad without picking one: their last used
+// there, else their newest. Null if none of theirs fits the pad.
+static json DefaultProfile(const std::string& player, const std::string& padName, int numSensors)
+{
+	const auto dir = Profiles::PlayerPadDir(gProfilesDir, player, padName);
+	const json& st = PadStateFor(padName);
+	const auto last = st.find("lastUsed");
+	json blob;
+	if (last != st.end() && last->is_object() && last->contains(player) && (*last)[player].is_string() &&
+	    Profiles::ReadProfile(dir, (*last)[player].get<std::string>(), blob) &&
+	    blob.value("sensorCount", -1) == numSensors)
+		return blob;
+	const json list = Profiles::List(dir); // oldest first
+	for (auto it = list.rbegin(); it != list.rend(); ++it)
+		if (it->value("sensorCount", -1) == numSensors)
+			return *it;
+	return nullptr;
+}
+
+struct Selected
+{
+	bool ok = true;
+	std::string error;
+	std::string name;          // of the profile now on the pad
+	bool guestCreated = false; // GUEST got its first profile on this pad
+};
+
+// Puts `wanted`'s settings on the pad: their DefaultProfile, or GUEST's if
+// they have none or aren't a known player. The first time GUEST is needed on
+// a pad, what the pad holds becomes its profile. With `keepCurrent`, a pad
+// already on that profile is left alone. Call with the store lock held.
+static Selected SelectPlayer(PadDevice* device, const std::string& wanted, bool keepCurrent)
+{
+	const std::string padName = device->State().name;
+	const int numSensors = device->State().numSensors;
+	std::string player = Players::Has(wanted) ? wanted : Players::GUEST;
+	json blob = DefaultProfile(player, padName, numSensors);
+	if (blob.is_null() && player != Players::GUEST)
+	{
+		player = Players::GUEST;
+		blob = DefaultProfile(player, padName, numSensors);
+	}
+	if (blob.is_null())
+	{
+		const auto dir = Profiles::PlayerPadDir(gProfilesDir, player, padName);
+		const std::string id = NewProfileId(dir, Players::GUEST);
+		json fresh;
+		device->SaveProfile(fresh, PROFILE_GROUPS);
+		fresh["id"] = id;
+		fresh["name"] = Players::GUEST;
+		fresh["description"] = "";
+		fresh["sensorCount"] = numSensors;
+		fresh["savedAt"] = (int64_t)std::time(nullptr);
+		if (!Profiles::Write(dir, id, fresh))
+			return {false, "could not write the profile", "", false};
+		SetPadSelection(padName, player, id, Players::GUEST);
+		return {true, "", Players::GUEST, true};
+	}
+	const std::string id = blob.value("id", std::string());
+	const std::string name = blob.value("name", std::string());
+	const json& st = PadStateFor(padName);
+	if (keepCurrent && st.value("player", "") == player && st.value("profileId", "") == id)
+		return {true, "", name, false};
+	std::vector<std::string> failed;
+	const bool applied = device->LoadProfile(blob, PROFILE_GROUPS, &failed);
+	SetPadSelection(padName, player, id, name); // as loadProfile: most of it is on the pad
+	return {applied, applied ? "" : NotApplied(failed), name, false};
 }
 
 // The op being handled, so a failure can still be answered.
@@ -1191,6 +1273,38 @@ static std::vector<ClientReply> HandleClientMessageImpl(const json& j, OpContext
 		return replies;
 	}
 
+	// From the game, which knows sides, not pads:
+	//   {setPlayer:{side: 1|2, player: "<name>" | null}}
+	// Every connected pad set to that side gets the player's settings (see
+	// SelectPlayer); null is a player leaving. Not answered.
+	if (j.contains("setPlayer"))
+	{
+		const json& op = j["setPlayer"];
+		const int64_t side =
+		    op.is_object() && op.contains("side") && op["side"].is_number_integer() ? op["side"].get<int64_t>() : 0;
+		if (side != 1 && side != 2)
+		{
+			std::printf("setPlayer :: needs side 1 or 2, ignored\n");
+			return replies;
+		}
+		const std::string wanted = HasString(op, "player") ? op["player"].get<std::string>() : "";
+		storeLock.lock();
+		for (PadDevice* device : connectionManager ? connectionManager->Pads() : vector<PadDevice*>{})
+		{
+			const std::string padName = device->State().name;
+			if (PadStateFor(padName).value("side", 0) != side || OtherPadNamed(device, padName))
+				continue;
+			device->FinishSave(true);
+			const Selected s = SelectPlayer(device, wanted, true);
+			if (s.guestCreated)
+				replies.push_back({PlayerProfilesJson(Players::GUEST), false});
+			const json& st = PadStateFor(padName);
+			std::printf("setPlayer :: side %d, pad '%s': %s / %s%s%s\n", (int)side, padName.c_str(),
+			            st.value("player", "").c_str(), s.name.c_str(), s.ok ? "" : " :: ", s.error.c_str());
+		}
+		return replies;
+	}
+
 	// Everything else acts on one pad, named by its HID path in `pad`, and is
 	// answered with {msgType 8, op, pad, ok, error, name}.
 	ctx = ContextOf(j);
@@ -1264,6 +1378,19 @@ static std::vector<ClientReply> HandleClientMessageImpl(const json& j, OpContext
 		// client shows the drift.
 		SetPadSelection(padName, player, blob.value("id", std::string()), blob.value("name", std::string()));
 		return done(applied, applied ? "" : NotApplied(failed), blob.value("name", std::string()));
+	}
+
+	// What picking a player in the game does (see SelectPlayer): their last
+	// used profile here, or the guest's. `name` is the profile's.
+	if (opName == "selectPlayer")
+	{
+		const Selected s = SelectPlayer(device, player, false);
+		if (s.guestCreated)
+		{
+			player = Players::GUEST;
+			refreshed();
+		}
+		return done(s.ok, s.error, s.name);
 	}
 
 	// Capture this pad's live settings. Two forms:
@@ -1366,12 +1493,20 @@ static std::vector<ClientReply> HandleClientMessageImpl(const json& j, OpContext
 		if (!Profiles::Delete(padDir(), id))
 			return done(false, "could not delete the profile");
 		json& st = PadStateFor(padName);
+		bool changed = false;
 		if (st.value("player", "") == player && st.value("profileId", "") == id)
 		{
 			st["profileId"] = "";
 			st["profileName"] = "";
-			SavePadState(padName);
+			changed = true;
 		}
+		if (st.contains("lastUsed") && st["lastUsed"].is_object() && st["lastUsed"].value(player, "") == id)
+		{
+			st["lastUsed"].erase(player);
+			changed = true;
+		}
+		if (changed)
+			SavePadState(padName);
 		refreshed();
 		return done(true, "");
 	}
@@ -1414,6 +1549,32 @@ static std::vector<ClientReply> HandleClientMessageImpl(const json& j, OpContext
 			st["buttonNames"][std::to_string(button)] = name;
 		SavePadState(padName);
 		return done(true, "", name);
+	}
+
+	// Which game side the pad is played from, for setPlayer: {pad, side: 0|1|2}
+	// (0: none). A side belongs to one connected pad: it is taken from the others.
+	if (opName == "setSide")
+	{
+		const int64_t side = j["side"].is_number_integer() ? j["side"].get<int64_t>() : -1;
+		if (side < 0 || side > 2)
+			return done(false, "unknown side");
+		if (OtherPadNamed(device, padName))
+			return done(false, fmt::format("another pad here is also named '{}', rename one first", padName));
+		for (PadDevice* other : connectionManager->Pads())
+		{
+			const std::string name = other->State().name;
+			json& st = PadStateFor(name);
+			const int64_t current = st.value("side", 0);
+			const int64_t next = other == device ? side : current == side ? 0 : current;
+			if (next == current)
+				continue;
+			if (next != 0)
+				st["side"] = next;
+			else
+				st.erase("side");
+			SavePadState(name);
+		}
+		return done(true, "");
 	}
 
 	// A rename. Profiles and pad state are keyed by pad name and move along.

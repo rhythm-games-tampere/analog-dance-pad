@@ -17,6 +17,17 @@
 		{ label: 'Stiff', pct: 20 }
 	];
 
+	// The preset just applied stays highlighted briefly: the bars alone don't
+	// show it, as live values move all the time.
+	let applied = $state<number | null>(null);
+	let appliedTimer: ReturnType<typeof setTimeout> | undefined;
+	function applyPreset(pct: number) {
+		onapply(pct, overwriteRelease);
+		applied = pct;
+		clearTimeout(appliedTimer);
+		appliedTimer = setTimeout(() => (applied = null), 1000);
+	}
+
 	let sliderPct = $state(10);
 	let overwriteRelease = $state(true);
 
@@ -47,7 +58,11 @@
 			<span class="text-muted-foreground text-sm">Presets</span>
 			<div class="flex gap-2">
 				{#each presets as p (p.pct)}
-					<Button variant="outline" class="flex-1" onclick={() => onapply(p.pct, overwriteRelease)}>
+					<Button
+						variant={applied === p.pct ? 'default' : 'outline'}
+						class="flex-1"
+						onclick={() => applyPreset(p.pct)}
+					>
 						{p.label}
 					</Button>
 				{/each}

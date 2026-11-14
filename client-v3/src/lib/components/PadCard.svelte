@@ -12,11 +12,11 @@
 	const duplicate = $derived(pads.duplicatePadNames.includes(device.name));
 </script>
 
-<button
+<a
+	href={pads.href('player', { pad: device.name })}
 	class="bg-card flex min-h-48 flex-col gap-3 rounded-xl p-5 text-left ring-1 transition-shadow {active
 		? 'ring-primary shadow-[0_0_18px_2px_var(--color-primary)]'
 		: 'ring-foreground/10'}"
-	onclick={() => pads.selectPad(device.id)}
 >
 	<div class="flex items-center gap-2">
 		<span class="text-2xl font-bold">{device.name || 'Pad'}</span>
@@ -49,4 +49,4 @@
 			</div>
 		{/each}
 	</div>
-</button>
+</a>

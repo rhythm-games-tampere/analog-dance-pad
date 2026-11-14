@@ -1,17 +1,32 @@
 <script lang="ts">
 	import './layout.css';
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
+	import { afterNavigate, goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import favicon from '$lib/assets/favicon.svg';
-	import { pads } from '$lib/pads.svelte';
+	import { pads, screenOf } from '$lib/pads.svelte';
 	import { Button } from '$lib/components/ui/button';
 
 	let { children } = $props();
 
-	// Own the connection lifecycle here so it survives navigation between routes
-	// (e.g. to /profiles); the pages just read the shared `pads` singleton.
+	// Own the connection lifecycle here so it survives navigation between routes;
+	// the pages just read the shared `pads` singleton.
 	onMount(() => {
 		pads.start();
+		const server = pads.rememberedServer;
+		if (page.route.id === '/' && server) goto(pads.href('pad', { server }), { replaceState: true });
 		return () => pads.stop();
+	});
+
+	$effect(() => {
+		const screen = screenOf(page.route.id);
+		const query = page.url.searchParams;
+		untrack(() => pads.sync(screen, query));
+	});
+
+	afterNavigate((nav) => {
+		pads.autoLoad =
+			nav.type === 'link' && nav.from?.route.id === '/player' && nav.to?.route.id === '/profile';
 	});
 </script>
 
@@ -36,10 +51,8 @@
 			<Button
 				variant="link"
 				size="sm"
-				onclick={() => {
-					pads.notice = null;
-					pads.goto('profile');
-				}}>Change</Button
+				href={pads.href('profile')}
+				onclick={() => (pads.notice = null)}>Change</Button
 			>
 		{/if}
 	</div>

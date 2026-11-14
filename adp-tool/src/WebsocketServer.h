@@ -20,7 +20,7 @@ namespace adp
 // Sent to every client on connect ({msgType 0, protocol}). Bumped on any
 // incompatible message change, so an old client cached on a phone can tell it
 // is out of date instead of half working.
-constexpr int PROTOCOL_VERSION = 2;
+constexpr int PROTOCOL_VERSION = 3;
 
 // Who may connect. Both are optional and off by default: the server is open
 // to any client by design (README, "Security model"). Browsers don't apply

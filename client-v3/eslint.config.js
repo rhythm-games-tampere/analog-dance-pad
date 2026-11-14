@@ -36,8 +36,9 @@ export default defineConfig(
 		}
 	},
 	{
-		// Override or add rule settings here, such as:
-		// 'svelte/button-has-type': 'error'
-		rules: {}
+		rules: {
+			// Every URL comes from pads.href(), which resolves the route and adds the query.
+			'svelte/no-navigation-without-resolve': 'off'
+		}
 	}
 );

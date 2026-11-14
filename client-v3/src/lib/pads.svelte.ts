@@ -1,4 +1,6 @@
 import { browser } from '$app/environment';
+import { goto } from '$app/navigation';
+import { resolve } from '$app/paths';
 import { untrack } from 'svelte';
 import serversConfig from './servers.config.json';
 
@@ -83,6 +85,8 @@ export interface PadState {
 	recent?: string[];
 	/** The pad was unplugged before its last edits were saved: it came back with older settings. */
 	editsLost?: boolean;
+	/** The game side (1 or 2) whose player the game puts on this pad; absent: none. */
+	side?: number;
 	/** Display names of the pad's buttons, keyed by 1-based button number. */
 	buttonNames?: Record<string, string>;
 }
@@ -107,6 +111,8 @@ export type Op =
 	| 'importProfile'
 	| 'updateProfile'
 	| 'deleteProfile'
+	| 'selectPlayer'
+	| 'setSide'
 	| 'rename'
 	| 'renameButton'
 	| 'setReleaseMode'
@@ -119,6 +125,7 @@ export interface OpResult {
 	ok: boolean;
 	error: string; // '' when ok
 	name: string; // the profile's (or, for rename/renameButton, the pad's/button's) name, when there is one
+	requestId?: string; // echoed from the request
 }
 
 /** A short-lived message for the user, e.g. an op result. */
@@ -149,9 +156,43 @@ export interface ServerConfig {
 	url: string;
 }
 
-/** The 4-step flow, then tuning. */
-export type Step = 'server' | 'pad' | 'player' | 'profile' | 'tune';
+/** One route per screen, in flow order; the selection travels in the query. */
+const ROUTES = {
+	server: '/',
+	pad: '/pad/',
+	player: '/player/',
+	profile: '/profile/',
+	tune: '/tune/',
+	arrow: '/tune/arrow/',
+	config: '/config/'
+} as const;
+export type Screen = keyof typeof ROUTES;
+export const SCREENS = Object.keys(ROUTES) as Screen[];
+export const screenOf = (routeId: string | null): Screen =>
+	SCREENS.find((s) => ROUTES[s] === `${routeId ?? ''}/`.replace('//', '/')) ?? 'server';
 
+const SELECTION = ['server', 'pad', 'player'] as const;
+/** How many of server, pad, player a screen's links carry / the screen can't do without. */
+const CARRIES: Record<Screen, number> = {
+	server: 0,
+	pad: 1,
+	player: 2,
+	profile: 3,
+	tune: 3,
+	arrow: 3,
+	config: 3
+};
+const REQUIRES: Record<Screen, number> = { ...CARRIES, config: 2 };
+
+export interface Selection {
+	server: string | null; // server name
+	pad: string | null; // pad name
+	player: string | null;
+	button: number | null; // the arrow screen's button
+}
+
+/** The player without profiles of their own: always there, never in the server's list (Players.h GUEST). */
+export const GUEST = 'Guest';
 export const MAX_PROFILES = 5; // per player per pad, enforced by the server too
 
 // Reconcile tolerance for float thresholds. Must sit between the device's
@@ -172,10 +213,12 @@ const STALE_MS = 2000;
 // wait behind the pad's save, which can take ~2s, then take ~150ms itself).
 const LOAD_TIMEOUT_MS = 10000;
 /** The adp-tool protocol this client speaks (WebsocketServer.h PROTOCOL_VERSION). */
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 /** Lowest release threshold the server stores, in device counts (Reporter.h MIN_RELEASE_COUNTS). */
 const MIN_RELEASE_COUNTS = 10;
 const MAX_BACKOFF_MS = 5000;
+/** Marks the saves commit() sends, so their success isn't announced. */
+const AUTOSAVE = 'autosave';
 const NOTICE_MS = 4000;
 
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
@@ -341,29 +384,18 @@ const SERVER_KEY = 'adp-server';
 /** Server list is baked in at build time from servers.config.json — not user-editable. */
 const SERVERS: ServerConfig[] = serversConfig.servers;
 
-/** Order-independent deep equality via key-sorted JSON (both sides come from the
- * server's nlohmann serialization, so this is exact for lights comparison). */
-const canon = (v: unknown): string =>
-	JSON.stringify(v, (_, val) =>
-		val && typeof val === 'object' && !Array.isArray(val)
-			? Object.fromEntries(
-					Object.keys(val as object)
-						.sort()
-						.map((k) => [k, (val as Record<string, unknown>)[k]])
-				)
-			: val
-	);
-
 class PadsStore {
 	readonly servers = SERVERS;
 	conns: Conn[] = $state([]);
 
 	// ---- Selection: server -> pad -> player -> profile ----
-	step: Step = $state('server');
+	// Mirrors the URL (see sync): links change it, nothing else does.
+	step: Screen = $state('server');
 	server: string | null = $state(null); // endpoint url, remembered per device
-	pad: string | null = $state(null); // HID path on that server
+	padName: string | null = $state(null);
 	player: string | null = $state(null);
-	/** Set when a player is picked; the profile step auto-loads a lone profile once. */
+	button: number | null = $state(null);
+	/** Set when arriving from the player screen; the profile screen auto-loads a lone profile once. */
 	autoLoad = $state(false);
 
 	/** Optimistic per-sensor edits for the selected pad, keyed by sensor index. */
@@ -383,19 +415,16 @@ class PadsStore {
 	#unsent: Record<number, SensorPatch> = {};
 	#noticeTimer: ReturnType<typeof setTimeout> | undefined;
 	#loadTimer: ReturnType<typeof setTimeout> | undefined;
+	/** The running load came from autoLoad: its profile screen is skipped by Back. */
+	#loadReplaces = false;
+	/** An edit was committed: store the pad's settings in the loaded profile once it has them. */
+	#saveWanted = false;
+	/** HID path the pad name last resolved to, to follow a rename. */
+	#lastPath: string | null = null;
 
 	/** Call once from the browser (onMount). Safe to call more than once. */
 	start() {
 		if (!browser || this.#clock) return;
-		try {
-			const s = localStorage.getItem(SERVER_KEY);
-			if (s && SERVERS.some((c) => c.url === s)) {
-				this.server = s;
-				this.step = 'pad';
-			}
-		} catch {
-			/* storage unavailable */
-		}
 		this.now = Date.now();
 		this.#clock = setInterval(() => (this.now = Date.now()), 250);
 		this.conns = SERVERS.map(
@@ -403,7 +432,10 @@ class PadsStore {
 				new Conn(s, {
 					snapshot: (c, pad) => {
 						// Clear optimistic edits the selected pad has caught up to.
-						if (c === this.conn && pad === this.pad) this.reconcile();
+						if (c === this.conn && pad === this.pad) {
+							this.reconcile();
+							this.#autosave();
+						}
 					},
 					result: (c, r) => this.#onResult(c, r)
 				})
@@ -420,17 +452,39 @@ class PadsStore {
 			});
 			// Profiles are listed per pad name: after the selected pad is renamed
 			// (here or by another client), list them again under the new name.
-			let lastPad: string | null = null;
-			let lastName: string | undefined;
+			let last: { pad: string; name: string } | null = null;
 			$effect(() => {
-				const name = this.device?.name;
-				const pad = this.pad;
+				const d = this.device;
+				if (!d) return;
+				const renamed = last?.pad === d.id && last.name !== d.name;
 				untrack(() => {
-					if (name && pad === lastPad && lastName && name !== lastName && this.player)
-						this.#requestProfiles(this.player);
+					if (renamed && this.player) this.#requestProfiles(this.player);
 				});
-				lastPad = pad;
-				lastName = name;
+				last = { pad: d.id, name: d.name };
+			});
+			// A reload lands on a screen before any socket is open: list the
+			// player's profiles as each server comes up.
+			$effect(() => {
+				const player = this.player;
+				if (!player) return;
+				for (const c of this.conns) if (c.status === 'open') c.send({ listProfiles: { player } });
+			});
+			// The URL names a pad the server doesn't have: renamed (follow it) or
+			// unplugged (pick another). Only once the device list is in.
+			$effect(() => {
+				const path = this.pad;
+				const c = this.conn;
+				if (path) {
+					this.#lastPath = path;
+					return;
+				}
+				if (!this.padName || c?.status !== 'open' || !c.devicesKnown) return;
+				const renamed = c.deviceList.find((d) => d.id === this.#lastPath);
+				untrack(() =>
+					goto(renamed ? this.href(this.step, { pad: renamed.name }) : this.href('pad'), {
+						replaceState: true
+					})
+				);
 			});
 		});
 	}
@@ -448,40 +502,65 @@ class PadsStore {
 
 	// ---- Navigation ----
 
-	selectServer(url: string) {
-		this.server = url;
-		this.pad = null;
-		this.#setLoading(null);
-		this.player = null;
-		this.#clearEdits();
-		this.step = 'pad';
+	/** The URL of `screen`, for the current selection with `sel` on top. */
+	href(screen: Screen, sel: Partial<Selection> = {}): string {
+		const cur: Selection = {
+			server: this.serverName || null,
+			pad: this.padName,
+			player: this.player,
+			button: this.button,
+			...sel
+		};
+		const q = SELECTION.slice(0, CARRIES[screen]).flatMap((k) => (cur[k] ? [[k, cur[k]]] : []));
+		if (screen === 'arrow' && cur.button) q.push(['button', String(cur.button)]);
+		const qs = new URLSearchParams(q).toString();
+		return resolve(ROUTES[screen]) + (qs ? `?${qs}` : '');
+	}
+
+	/** The server this device used last, to skip the server screen on a fresh visit. */
+	get rememberedServer(): string | null {
 		try {
-			localStorage.setItem(SERVER_KEY, url);
+			const url = localStorage.getItem(SERVER_KEY);
+			return SERVERS.find((c) => c.url === url)?.name ?? null;
 		} catch {
-			/* storage unavailable */
+			return null;
 		}
 	}
 
-	selectPad(path: string) {
-		this.pad = path;
-		this.player = null;
-		this.#setLoading(null);
-		this.#clearEdits();
-		this.step = 'player';
-		this.conn?.send({ rescanPlayers: true }); // pick up just-created players
-	}
-
-	selectPlayer(name: string) {
-		this.player = name;
-		this.autoLoad = true;
-		this.step = 'profile';
-		this.#requestProfiles(name);
-	}
-
-	goto(step: Step) {
-		if (step === 'profile' && this.player) this.#requestProfiles(this.player);
-		this.autoLoad = false;
-		this.step = step;
+	/** Takes the selection from the URL; a screen missing part of it goes back to pick it. */
+	sync(screen: Screen, q: URLSearchParams) {
+		const server = SERVERS.find((c) => c.name === q.get('server'));
+		const padName = q.get('pad') || null;
+		const player = q.get('player') || null;
+		const have = !server ? 0 : !padName ? 1 : !player ? 2 : 3;
+		if (have < REQUIRES[screen]) {
+			const back = SCREENS[have];
+			goto(this.href(back, { server: server?.name ?? null, pad: padName, player }), {
+				replaceState: true
+			});
+			return;
+		}
+		const padChanged = (server?.url ?? null) !== this.server || padName !== this.padName;
+		const entered = screen !== this.step;
+		this.server = server?.url ?? null;
+		this.padName = padName;
+		this.player = player;
+		this.button = Number(q.get('button')) || null;
+		this.step = screen;
+		if (padChanged) {
+			this.#lastPath = null;
+			this.#setLoading(null);
+			this.#clearEdits();
+		}
+		if (server)
+			try {
+				localStorage.setItem(SERVER_KEY, server.url);
+			} catch {
+				/* storage unavailable */
+			}
+		// pick up just-created players
+		if (screen === 'player' && (entered || padChanged)) this.conn?.send({ rescanPlayers: true });
+		if (screen === 'profile' && player && entered) this.#requestProfiles(player);
 	}
 
 	/** Every server keeps only its own pads' profiles: ask them all (copy sources). */
@@ -496,7 +575,7 @@ class PadsStore {
 	}
 
 	get serverName(): string {
-		return this.conn?.name ?? '';
+		return SERVERS.find((c) => c.url === this.server)?.name ?? '';
 	}
 
 	/** The selected server's pads. */
@@ -505,7 +584,12 @@ class PadsStore {
 	}
 
 	get device(): DeviceInfo | undefined {
-		return this.devices.find((d) => d.id === this.pad);
+		return this.devices.find((d) => d.name === this.padName);
+	}
+
+	/** The selected pad's HID path on the selected server, while it is connected. */
+	get pad(): string | null {
+		return this.device?.id ?? null;
 	}
 
 	/** Pad names used more than once on the selected server, where profiles are keyed by pad name. */
@@ -616,43 +700,6 @@ class PadsStore {
 		return this.playerProfiles?.find((p) => p.id === st.profileId) ?? null;
 	}
 
-	/** True if the pad's live settings have drifted from the loaded profile. */
-	get isModified(): boolean {
-		const p = this.loadedProfile;
-		const snap = this.activeSnapshot;
-		const device = this.device;
-		if (!p || !snap || !device) return false;
-		const n = Math.min(p.sensors.length, snap.sensors.length);
-		// In "None" release mode the pad holds release == threshold whatever the
-		// profile says, so release values aren't compared there.
-		const compareRelease = snap.releaseMode !== 0;
-		for (let i = 0; i < n; i++) {
-			const a = p.sensors[i];
-			const b = snap.sensors[i];
-			if (Math.abs((a.threshold ?? 0) - b.threshold) > EPS) return true;
-			if (compareRelease && Math.abs((a.releaseThreshold ?? 0) - b.releaseThreshold) > EPS)
-				return true;
-			// The server skips gain and lights a pad lacks when loading a profile
-			// (e.g. one copied from another pad), so those can't drift.
-			if (
-				device.featureDigipot &&
-				a.resistorValue !== undefined &&
-				a.resistorValue !== b.resistorValue
-			)
-				return true;
-		}
-		// Lights arrive in their own (gated) message; only compare once we've got
-		// them, so we don't flag drift before the first lights message lands. A
-		// profile without lights (saved on a pad that has none) leaves them as
-		// they were when loaded, so there is nothing to compare.
-		const lights = this.pad && device.featureLights ? this.conn?.lights[this.pad] : undefined;
-		if (lights) {
-			if (p.lightRules && canon(p.lightRules) !== canon(lights.lightRules)) return true;
-			if (p.ledMappings && canon(p.ledMappings) !== canon(lights.ledMappings)) return true;
-		}
-		return false;
-	}
-
 	/** A player's avatar, once fetched (see requestAvatar). undefined = none / not yet. */
 	avatar(player: Player): Avatar | undefined {
 		return this.conn?.avatars[player.name] ?? undefined;
@@ -670,6 +717,7 @@ class PadsStore {
 	#clearEdits() {
 		this.pending = {};
 		this.#unsent = {};
+		this.#saveWanted = false;
 	}
 
 	#setLoading(id: string | null) {
@@ -693,6 +741,7 @@ class PadsStore {
 	#onResult(c: Conn, r: OpResult) {
 		if (c !== this.conn) return;
 		if (r.op === 'loadProfile' && r.pad === this.pad) this.#setLoading(null);
+		if (r.ok && r.requestId === AUTOSAVE) return;
 		this.showNotice(
 			r.ok
 				? { ok: true, op: r.op, text: OP_DONE[r.op]?.(r.name) ?? 'Done' }
@@ -705,7 +754,15 @@ class PadsStore {
 			r.pad === this.pad &&
 			this.step === 'profile'
 		)
-			this.step = 'tune';
+			goto(this.href('tune'), { replaceState: r.op === 'loadProfile' && this.#loadReplaces });
+		if (
+			r.ok &&
+			r.op === 'selectPlayer' &&
+			r.pad === this.pad &&
+			this.player === GUEST &&
+			this.step === 'profile'
+		)
+			goto(this.href('tune'), { replaceState: true });
 	}
 
 	// ---- Profile actions (selected pad + player) ----
@@ -718,12 +775,21 @@ class PadsStore {
 	}
 
 	/** Shows as loading (loadingProfile) until the server answers: the pad is busy meanwhile. */
-	loadProfile(id: string) {
+	loadProfile(id: string, auto = false) {
 		if (this.loadingProfile) return;
 		if (this.#sendPad({ loadProfile: { player: this.player, id } })) {
+			this.#loadReplaces = auto;
 			this.#clearEdits();
 			this.#setLoading(id);
 		}
+	}
+
+	/**
+	 * Puts the selected player's last used profile on the pad, or the guest's
+	 * if they have none. The guest moves on to tuning (see #onResult).
+	 */
+	selectPlayer() {
+		if (this.#sendPad({ selectPlayer: { player: this.player } })) this.#clearEdits();
 	}
 
 	/** Loads/saves move on to tuning once the server confirms (see #onResult). */
@@ -731,8 +797,21 @@ class PadsStore {
 		this.#sendPad({ saveProfile: { player: this.player, name } });
 	}
 
-	overwriteProfile(id: string) {
-		this.#sendPad({ saveProfile: { player: this.player, id } });
+	/**
+	 * An edit is complete (a drag was released, a button pressed): the loaded
+	 * profile follows the pad. Call after the edit; a drag in progress isn't one.
+	 */
+	commit() {
+		this.#saveWanted = true;
+		this.#autosave();
+	}
+
+	/** The server saves what the pad holds, so this waits until the pad has echoed every edit. */
+	#autosave() {
+		if (!this.#saveWanted || Object.keys(this.pending).length > 0) return;
+		this.#saveWanted = false;
+		const p = this.loadedProfile;
+		if (p) this.#sendPad({ saveProfile: { player: this.player, id: p.id }, requestId: AUTOSAVE });
 	}
 
 	/**
@@ -810,6 +889,11 @@ class PadsStore {
 		this.#sendPad({ buttonName: { button, name } });
 	}
 
+	/** The game side whose player the game puts on this pad: 1, 2, or 0 for none. */
+	setSide(side: number) {
+		this.#sendPad({ side });
+	}
+
 	/** Release mode: 0 none, 2 per-sensor. */
 	setReleaseMode(mode: number) {
 		this.#sendPad({ releaseMode: mode });
@@ -833,6 +917,7 @@ class PadsStore {
 				this.#patch(i, { threshold, releaseThreshold: threshold }); // release == press
 			else this.#patch(i, { threshold }); // threshold only
 		});
+		this.commit();
 	}
 
 	#scheduleSend() {
@@ -912,6 +997,8 @@ const OP_VERBS: Record<Op, string> = {
 	importProfile: 'copy the profile',
 	updateProfile: 'rename the profile',
 	deleteProfile: 'delete the profile',
+	selectPlayer: 'load the settings',
+	setSide: 'set the side',
 	rename: 'rename the pad',
 	renameButton: 'name the button',
 	setReleaseMode: 'change the release mode',
@@ -924,6 +1011,8 @@ const OP_DONE: Record<Op, (name: string) => string> = {
 	importProfile: (n) => `Copied as ${n}`,
 	updateProfile: (n) => `Renamed to ${n}`,
 	deleteProfile: () => 'Profile deleted',
+	selectPlayer: (n) => `Loaded ${n}`,
+	setSide: () => 'Side set',
 	rename: (n) => `Pad renamed to ${n}`,
 	renameButton: (n) => (n ? `Button named ${n}` : 'Button name cleared'),
 	setReleaseMode: () => 'Release mode changed',
