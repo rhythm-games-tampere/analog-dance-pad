@@ -1075,50 +1075,73 @@ struct Selected
 {
 	bool ok = true;
 	std::string error;
-	std::string name;          // of the profile now on the pad
-	bool guestCreated = false; // GUEST got its first profile on this pad
+	std::string name;                 // of the profile now on the pad
+	std::vector<std::string> created; // players who got a profile on this pad
 };
 
-// Puts `wanted`'s settings on the pad: their DefaultProfile, or GUEST's if
-// they have none or aren't a known player. The first time GUEST is needed on
-// a pad, what the pad holds becomes its profile. With `keepCurrent`, a pad
-// already on that profile is left alone. Call with the store lock held.
+// The name of the profile a player gets on a pad they have none on.
+static constexpr const char* DEFAULT_PROFILE = "default";
+
+// Writes `blob` (a profile's settings) as a new profile `name` in `dir`.
+static bool WriteNewProfile(const Profiles::Path& dir, const std::string& name, int numSensors, json& blob)
+{
+	blob["id"] = NewProfileId(dir, name);
+	blob["name"] = name;
+	blob["description"] = "";
+	blob["sensorCount"] = numSensors;
+	blob["savedAt"] = (int64_t)std::time(nullptr);
+	return Profiles::Write(dir, blob["id"].get<std::string>(), blob);
+}
+
+// Puts `wanted`'s settings on the pad: their DefaultProfile. A known player
+// without one gets a copy of GUEST's as their DEFAULT_PROFILE; anyone else
+// (or a player with no room for it) gets GUEST's itself. The first time GUEST
+// is needed on a pad, what the pad holds becomes its profile. With
+// `keepCurrent`, a pad already on that profile is left alone. Call with the
+// store lock held.
 static Selected SelectPlayer(PadDevice* device, const std::string& wanted, bool keepCurrent)
 {
 	const std::string padName = device->State().name;
 	const int numSensors = device->State().numSensors;
+	Selected s;
 	std::string player = Players::Has(wanted) ? wanted : Players::GUEST;
 	json blob = DefaultProfile(player, padName, numSensors);
-	if (blob.is_null() && player != Players::GUEST)
-	{
-		player = Players::GUEST;
-		blob = DefaultProfile(player, padName, numSensors);
-	}
+	bool fresh = false; // captured from the pad just now: nothing to load
 	if (blob.is_null())
 	{
+		const auto guestDir = Profiles::PlayerPadDir(gProfilesDir, Players::GUEST, padName);
+		blob = DefaultProfile(Players::GUEST, padName, numSensors);
+		if (blob.is_null())
+		{
+			blob = json::object();
+			device->SaveProfile(blob, PROFILE_GROUPS);
+			if (!WriteNewProfile(guestDir, Players::GUEST, numSensors, blob))
+				return {false, "could not write the profile", "", {}};
+			s.created.push_back(Players::GUEST);
+			fresh = true;
+		}
 		const auto dir = Profiles::PlayerPadDir(gProfilesDir, player, padName);
-		const std::string id = NewProfileId(dir, Players::GUEST);
-		json fresh;
-		device->SaveProfile(fresh, PROFILE_GROUPS);
-		fresh["id"] = id;
-		fresh["name"] = Players::GUEST;
-		fresh["description"] = "";
-		fresh["sensorCount"] = numSensors;
-		fresh["savedAt"] = (int64_t)std::time(nullptr);
-		if (!Profiles::Write(dir, id, fresh))
-			return {false, "could not write the profile", "", false};
-		SetPadSelection(padName, player, id, Players::GUEST);
-		return {true, "", Players::GUEST, true};
+		json own = blob;
+		if (player != Players::GUEST && Profiles::List(dir).size() < Profiles::MAX_PER_PAD &&
+		    WriteNewProfile(dir, DEFAULT_PROFILE, numSensors, own))
+		{
+			blob = std::move(own);
+			s.created.push_back(player);
+		}
+		else
+			player = Players::GUEST;
 	}
 	const std::string id = blob.value("id", std::string());
-	const std::string name = blob.value("name", std::string());
+	s.name = blob.value("name", std::string());
 	const json& st = PadStateFor(padName);
 	if (keepCurrent && st.value("player", "") == player && st.value("profileId", "") == id)
-		return {true, "", name, false};
+		return s;
 	std::vector<std::string> failed;
-	const bool applied = device->LoadProfile(blob, PROFILE_GROUPS, &failed);
-	SetPadSelection(padName, player, id, name); // as loadProfile: most of it is on the pad
-	return {applied, applied ? "" : NotApplied(failed), name, false};
+	s.ok = fresh || device->LoadProfile(blob, PROFILE_GROUPS, &failed);
+	SetPadSelection(padName, player, id, s.name); // as loadProfile: most of it is on the pad
+	if (!s.ok)
+		s.error = NotApplied(failed);
+	return s;
 }
 
 // The op being handled, so a failure can still be answered.
@@ -1296,8 +1319,11 @@ static std::vector<ClientReply> HandleClientMessageImpl(const json& j, OpContext
 				continue;
 			device->FinishSave(true);
 			const Selected s = SelectPlayer(device, wanted, true);
-			if (s.guestCreated)
-				replies.push_back({PlayerProfilesJson(Players::GUEST), false});
+			for (const std::string& p : s.created)
+			{
+				replies.push_back({PlayerProfilesJson(p), false});
+				Players::RequestRecount(p);
+			}
 			const json& st = PadStateFor(padName);
 			std::printf("setPlayer :: side %d, pad '%s': %s / %s%s%s\n", (int)side, padName.c_str(),
 			            st.value("player", "").c_str(), s.name.c_str(), s.ok ? "" : " :: ", s.error.c_str());
@@ -1380,14 +1406,14 @@ static std::vector<ClientReply> HandleClientMessageImpl(const json& j, OpContext
 		return done(applied, applied ? "" : NotApplied(failed), blob.value("name", std::string()));
 	}
 
-	// What picking a player in the game does (see SelectPlayer): their last
-	// used profile here, or the guest's. `name` is the profile's.
+	// What picking a player in the game does (see SelectPlayer). `name` is
+	// the profile's.
 	if (opName == "selectPlayer")
 	{
 		const Selected s = SelectPlayer(device, player, false);
-		if (s.guestCreated)
+		for (const std::string& p : s.created)
 		{
-			player = Players::GUEST;
+			player = p;
 			refreshed();
 		}
 		return done(s.ok, s.error, s.name);

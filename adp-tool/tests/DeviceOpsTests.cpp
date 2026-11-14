@@ -561,21 +561,35 @@ TEST_CASE("Selecting a player loads their last used profile, else their newest",
 	CHECK(r["name"] == "Second");
 }
 
-TEST_CASE("A player without profiles gets the guest's, made from the pad the first time", "[deviceops]")
+TEST_CASE("A player without profiles gets a default one copied from the guest's", "[deviceops]")
 {
 	Server server;
 	server.AddPad("p1", "Cab1 P1");
 	const auto guestDir = Profiles::PlayerPadDir(server.dir, "Guest", "Cab1 P1");
+	const auto mikeDir = Profiles::PlayerPadDir(server.dir, "Mike", "Cab1 P1");
 
+	// The first time, the guest's is made from what the pad holds.
 	json r = Server::Send({{"pad", "p1"}, {"selectPlayer", {{"player", "Mike"}}}});
 	CHECK(r["ok"] == true);
-	CHECK(r["name"] == "Guest");
+	CHECK(r["name"] == "default");
 	CHECK(Profiles::Exists(guestDir, "guest"));
-	CHECK(Server::PadState("p1")["player"] == "Guest");
+	CHECK(Profiles::Exists(mikeDir, "default"));
+	CHECK(Server::PadState("p1")["player"] == "Mike");
+	CHECK(Server::PadState("p1")["profileId"] == "default");
 
 	r = Server::Send({{"pad", "p1"}, {"selectPlayer", {{"player", "Mike"}}}});
 	CHECK(r["ok"] == true);
 	CHECK(Profiles::List(guestDir).size() == 1);
+	CHECK(Profiles::List(mikeDir).size() == 1);
+
+	json guest, own;
+	REQUIRE(Profiles::ReadProfile(guestDir, "guest", guest));
+	REQUIRE(Profiles::ReadProfile(mikeDir, "default", own));
+	CHECK(own["sensors"] == guest["sensors"]);
+
+	r = Server::Send({{"pad", "p1"}, {"selectPlayer", {{"player", "Guest"}}}});
+	CHECK(r["name"] == "Guest");
+	CHECK(Server::PadState("p1")["player"] == "Guest");
 }
 
 TEST_CASE("The game sets the player of a side's pad", "[deviceops]")

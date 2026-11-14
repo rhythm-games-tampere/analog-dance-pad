@@ -65,6 +65,13 @@
 	const sideValue = $derived(String(pads.padState?.side ?? 0));
 	const sideLabel = $derived(sides.find((s) => s.v === sideValue)?.label ?? 'None');
 
+	const deviceModes = [
+		{ v: 'personal', label: 'Personal' },
+		{ v: 'shared', label: 'Shared' }
+	];
+	const deviceModeValue = $derived(pads.shared ? 'shared' : 'personal');
+	const deviceModeLabel = $derived(pads.shared ? 'Shared' : 'Personal');
+
 	const releaseModes = [
 		{ v: '0', label: 'None' },
 		{ v: '2', label: 'Per-sensor' }
@@ -115,6 +122,33 @@
 			Back to tuning
 		</Button>
 	</header>
+
+	<Card.Root>
+		<Card.Header>
+			<Card.Title>This device</Card.Title>
+		</Card.Header>
+		<Card.Content class="flex flex-col gap-1.5">
+			<Label>Used as</Label>
+			<Select.Root
+				type="single"
+				value={deviceModeValue}
+				onValueChange={(v) => v && pads.setShared(v === 'shared')}
+			>
+				<Select.Trigger class="w-40">{deviceModeLabel}</Select.Trigger>
+				<Select.Content>
+					{#each deviceModes as m (m.v)}
+						<Select.Item value={m.v} label={m.label}>{m.label}</Select.Item>
+					{/each}
+				</Select.Content>
+			</Select.Root>
+			<p class="text-muted-foreground text-sm">
+				<em>Personal</em>: your own phone or tablet. It remembers your player, opens on the pad you
+				are playing on, follows you when you switch pads in the game, and leaves the tuning screen
+				when someone else takes the pad. <em>Shared</em>: stays with its machine and opens on the
+				pad picker.
+			</p>
+		</Card.Content>
+	</Card.Root>
 
 	{#if snap}
 		<!-- Device settings -->

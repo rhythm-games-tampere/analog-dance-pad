@@ -25,8 +25,8 @@
 	}
 
 	// Once, when arriving from the player screen (the header chip comes back
-	// here freely): the guest goes straight to tuning, a player with exactly one
-	// profile gets it loaded, one with none gets the guest's settings to start from.
+	// here freely): the guest goes straight to tuning, and so does a player with
+	// one profile or none (the server makes them a "default" one).
 	$effect(() => {
 		if (!pads.autoLoad || (pads.player !== GUEST && profiles === undefined)) return;
 		pads.autoLoad = false;

@@ -220,6 +220,8 @@ const MAX_BACKOFF_MS = 5000;
 /** Marks the saves commit() sends, so their success isn't announced. */
 const AUTOSAVE = 'autosave';
 const NOTICE_MS = 4000;
+/** How long a fresh page waits for every server's pad states before deciding where to open. */
+const OPEN_WAIT_MS = 2000;
 
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const clampByte = (v: number) => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
@@ -248,6 +250,8 @@ class Conn {
 	/** False while the server can't reach LocalProfiles; `players` is then the last known list. */
 	localProfilesOk = $state(true);
 	padStates: Record<string, PadState> = $state({});
+	/** True once this connection's pad states arrived (false while (re)connecting). */
+	padStatesKnown = $state(false);
 	/** player -> pad name -> profiles, filled by listProfiles replies. */
 	profiles: Record<string, Record<string, Profile[]>> = $state({});
 	/** player -> avatar; null while requested. */
@@ -325,6 +329,7 @@ class Conn {
 			if (msg.pad) this.lights[msg.pad] = m as Lights;
 		} else if (msg.msgType === 5) {
 			this.padStates = (m as { pads: Record<string, PadState> }).pads;
+			this.padStatesKnown = true;
 		} else if (msg.msgType === 6) {
 			const r = m as { player: string; pads: Record<string, Profile[]> };
 			this.profiles[r.player] = r.pads;
@@ -344,6 +349,7 @@ class Conn {
 		this.devicesKnown = false;
 		this.lights = {};
 		this.padStates = {};
+		this.padStatesKnown = false;
 		// Requests made while down were dropped: forget those so they are asked
 		// again, but keep fetched avatars (they can be MBs each).
 		this.avatars = Object.fromEntries(Object.entries(this.avatars).filter(([, a]) => a !== null));
@@ -381,6 +387,25 @@ class Conn {
 }
 
 const SERVER_KEY = 'adp-server';
+const SHARED_KEY = 'adp-shared';
+const PLAYER_KEY = 'adp-player';
+
+function stored(key: string): string | null {
+	try {
+		return localStorage.getItem(key);
+	} catch {
+		return null;
+	}
+}
+
+function store(key: string, value: string | null) {
+	try {
+		if (value === null) localStorage.removeItem(key);
+		else localStorage.setItem(key, value);
+	} catch {
+		/* storage unavailable */
+	}
+}
 /** Server list is baked in at build time from servers.config.json — not user-editable. */
 const SERVERS: ServerConfig[] = serversConfig.servers;
 
@@ -422,10 +447,26 @@ class PadsStore {
 	/** HID path the pad name last resolved to, to follow a rename. */
 	#lastPath: string | null = null;
 
+	/**
+	 * A shared device belongs to the arcade and stays with its cab; a personal
+	 * one (the default) follows its player between pads. Kept per device.
+	 */
+	shared = $state(false);
+	/** The player last tuned on this personal device. */
+	#myPlayer: string | null = null;
+	/** Each pad's player as last seen, by endpoint + path; kept while a server is down. */
+	#padPlayers = new Map<string, string | undefined>();
+	/** A fresh page hasn't decided yet where its player is (see #open). */
+	#opening = $state(false);
+	#startedAt = 0;
+
 	/** Call once from the browser (onMount). Safe to call more than once. */
 	start() {
 		if (!browser || this.#clock) return;
-		this.now = Date.now();
+		this.now = this.#startedAt = Date.now();
+		this.shared = stored(SHARED_KEY) === '1';
+		this.#myPlayer = this.shared ? null : stored(PLAYER_KEY);
+		this.#opening = !!this.#myPlayer;
 		this.#clock = setInterval(() => (this.now = Date.now()), 250);
 		this.conns = SERVERS.map(
 			(s) =>
@@ -486,7 +527,90 @@ class PadsStore {
 					})
 				);
 			});
+			$effect(() => {
+				if (!this.#opening) return;
+				const settled = this.conns.every(
+					(c) => c.status === 'offline' || (c.status === 'open' && c.padStatesKnown)
+				);
+				if (settled || this.now - this.#startedAt >= OPEN_WAIT_MS) untrack(() => this.#open());
+			});
+			$effect(() => {
+				for (const c of this.conns) for (const st of Object.values(c.padStates)) void st.player;
+				untrack(() => this.#watchPads());
+			});
 		});
+	}
+
+	/** A personal device opens where its player is active, if that is exactly one pad. */
+	#open() {
+		this.#opening = false;
+		const me = this.#myPlayer;
+		const tuning = this.step === 'tune' || this.step === 'arrow';
+		if (!me || !(this.step === 'server' || this.step === 'pad' || (tuning && this.player === me)))
+			return;
+		const at = this.conns.flatMap((c) =>
+			Object.values(c.padStates)
+				.filter((st) => st.player === me)
+				.map((st) => ({ server: c.name, pad: st.name }))
+		);
+		if (tuning && at.some((a) => a.server === this.serverName && a.pad === this.padName)) return;
+		if (at.length === 1) goto(this.href('tune', { ...at[0], player: me }), { replaceState: true });
+		else if (tuning) goto(this.href('pad'), { replaceState: true });
+	}
+
+	/** The user navigated before the page decided where to open: leave them there. */
+	userNavigated() {
+		this.#opening = false;
+	}
+
+	/**
+	 * On a personal device: follows its player to the pad they were just put on
+	 * (on any server), and leaves the tuning screens when the pad being tuned
+	 * goes to someone else.
+	 */
+	#watchPads() {
+		const me = this.shared ? null : this.#myPlayer;
+		const tuning = this.step === 'tune' || this.step === 'arrow';
+		let follow: { server: string; pad: string } | null = null;
+		let left = false;
+		for (const c of this.conns)
+			for (const [path, st] of Object.entries(c.padStates)) {
+				const key = `${c.endpoint}\n${path}`;
+				const known = this.#padPlayers.has(key);
+				const was = this.#padPlayers.get(key);
+				this.#padPlayers.set(key, st.player);
+				if (!known || was === st.player) continue;
+				if (me && st.player === me) follow = { server: c.name, pad: st.name };
+				else if (was === this.player && c === this.conn && path === this.pad) left = true;
+			}
+		if (this.shared) return;
+		if (follow && this.step !== 'config') {
+			this.#opening = false;
+			const here =
+				follow.server === this.serverName &&
+				follow.pad === this.padName &&
+				this.player === me &&
+				(tuning || this.step === 'profile');
+			if (here) return;
+			this.showNotice({ ok: true, text: `${me} is now on ${follow.pad}` });
+			goto(this.href('tune', { ...follow, player: me }), { replaceState: tuning });
+		} else if (left && tuning) {
+			this.showNotice({ ok: true, text: `${this.player} is no longer on ${this.padName}` });
+			goto(this.href('pad'), { replaceState: true });
+		}
+	}
+
+	setShared(shared: boolean) {
+		this.shared = shared;
+		store(SHARED_KEY, shared ? '1' : null);
+		if (shared) {
+			this.#myPlayer = null;
+			this.#opening = false;
+			store(PLAYER_KEY, null);
+		} else if (this.player && this.player !== GUEST) {
+			this.#myPlayer = this.player;
+			store(PLAYER_KEY, this.player);
+		}
 	}
 
 	stop() {
@@ -558,6 +682,16 @@ class PadsStore {
 			} catch {
 				/* storage unavailable */
 			}
+		if (
+			!this.shared &&
+			player &&
+			player !== GUEST &&
+			player !== this.#myPlayer &&
+			(screen === 'tune' || screen === 'arrow')
+		) {
+			this.#myPlayer = player;
+			store(PLAYER_KEY, player);
+		}
 		// pick up just-created players
 		if (screen === 'player' && (entered || padChanged)) this.conn?.send({ rescanPlayers: true });
 		if (screen === 'profile' && player && entered) this.#requestProfiles(player);
@@ -578,9 +712,12 @@ class PadsStore {
 		return SERVERS.find((c) => c.url === this.server)?.name ?? '';
 	}
 
-	/** The selected server's pads. */
+	/** The selected server's pads: the P1 side's first, then P2's, then those without a side. */
 	get devices(): DeviceInfo[] {
-		return this.conn?.deviceList ?? [];
+		const c = this.conn;
+		if (!c) return [];
+		const order = (d: DeviceInfo) => c.padStates[d.id]?.side || 3;
+		return [...c.deviceList].sort((a, b) => order(a) - order(b));
 	}
 
 	get device(): DeviceInfo | undefined {
@@ -755,13 +892,7 @@ class PadsStore {
 			this.step === 'profile'
 		)
 			goto(this.href('tune'), { replaceState: r.op === 'loadProfile' && this.#loadReplaces });
-		if (
-			r.ok &&
-			r.op === 'selectPlayer' &&
-			r.pad === this.pad &&
-			this.player === GUEST &&
-			this.step === 'profile'
-		)
+		if (r.ok && r.op === 'selectPlayer' && r.pad === this.pad && this.step === 'profile')
 			goto(this.href('tune'), { replaceState: true });
 	}
 
@@ -774,9 +905,20 @@ class PadsStore {
 		return sent;
 	}
 
+	/** Asks before the pad is taken from another player (the guest is nobody's). */
+	#mayTakeOver(): boolean {
+		const cur = this.padState?.player;
+		return (
+			!cur ||
+			cur === GUEST ||
+			cur === this.player ||
+			window.confirm(`${cur} is active on ${this.padName}. Switch the pad to ${this.player}?`)
+		);
+	}
+
 	/** Shows as loading (loadingProfile) until the server answers: the pad is busy meanwhile. */
 	loadProfile(id: string, auto = false) {
-		if (this.loadingProfile) return;
+		if (this.loadingProfile || !this.#mayTakeOver()) return;
 		if (this.#sendPad({ loadProfile: { player: this.player, id } })) {
 			this.#loadReplaces = auto;
 			this.#clearEdits();
@@ -785,16 +927,18 @@ class PadsStore {
 	}
 
 	/**
-	 * Puts the selected player's last used profile on the pad, or the guest's
-	 * if they have none. The guest moves on to tuning (see #onResult).
+	 * Puts the selected player's last used profile on the pad; one without any
+	 * gets a "default" profile copied from the guest's. Moves on to tuning (see
+	 * #onResult).
 	 */
 	selectPlayer() {
-		if (this.#sendPad({ selectPlayer: { player: this.player } })) this.#clearEdits();
+		if (this.#mayTakeOver() && this.#sendPad({ selectPlayer: { player: this.player } }))
+			this.#clearEdits();
 	}
 
 	/** Loads/saves move on to tuning once the server confirms (see #onResult). */
 	saveProfileAs(name: string) {
-		this.#sendPad({ saveProfile: { player: this.player, name } });
+		if (this.#mayTakeOver()) this.#sendPad({ saveProfile: { player: this.player, name } });
 	}
 
 	/**

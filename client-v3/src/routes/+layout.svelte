@@ -25,6 +25,7 @@
 	});
 
 	afterNavigate((nav) => {
+		if (nav.type === 'link' || nav.type === 'popstate') pads.userNavigated();
 		pads.autoLoad =
 			nav.type === 'link' && nav.from?.route.id === '/player' && nav.to?.route.id === '/profile';
 	});
